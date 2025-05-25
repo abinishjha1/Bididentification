@@ -1,0 +1,177 @@
+
+-- First, let's add missing foreign key relationships that weren't properly created
+ALTER TABLE bids ADD CONSTRAINT bids_contractor_id_fkey 
+FOREIGN KEY (contractor_id) REFERENCES contractors(id);
+
+ALTER TABLE bids ADD CONSTRAINT bids_project_id_fkey 
+FOREIGN KEY (project_id) REFERENCES projects(id);
+
+ALTER TABLE bids ADD CONSTRAINT bids_email_record_id_fkey 
+FOREIGN KEY (email_record_id) REFERENCES email_records(id);
+
+ALTER TABLE bid_classifications ADD CONSTRAINT bid_classifications_bid_id_fkey 
+FOREIGN KEY (bid_id) REFERENCES bids(id);
+
+ALTER TABLE bid_classifications ADD CONSTRAINT bid_classifications_classification_id_fkey 
+FOREIGN KEY (classification_id) REFERENCES classifications(id);
+
+ALTER TABLE bid_documents ADD CONSTRAINT bid_documents_bid_id_fkey 
+FOREIGN KEY (bid_id) REFERENCES bids(id);
+
+ALTER TABLE contracts ADD CONSTRAINT contracts_bid_id_fkey 
+FOREIGN KEY (bid_id) REFERENCES bids(id);
+
+-- Insert sample classification categories for bid identification
+INSERT INTO classifications (name, category, description) VALUES
+('Bid Submission', 'email_type', 'Initial bid submission email'),
+('Bid Inquiry', 'email_type', 'Inquiry about bidding opportunity'),
+('Follow-up Communication', 'email_type', 'Follow-up on existing bid'),
+('Contract Related', 'email_type', 'Contract discussion or documentation'),
+('Project Update', 'email_type', 'Updates on project status'),
+('High Value Bid', 'value_range', 'Bids over $100,000'),
+('Medium Value Bid', 'value_range', 'Bids between $10,000 - $100,000'),
+('Low Value Bid', 'value_range', 'Bids under $10,000'),
+('Construction Project', 'project_type', 'Construction related bids'),
+('IT Services', 'project_type', 'IT and technology service bids'),
+('Consulting Services', 'project_type', 'Professional consulting bids');
+
+-- Insert sample email records for testing
+INSERT INTO email_records (subject, sender_email, sender_name, recipient_email, received_date, body_text, email_type) VALUES
+('Bid Submission for Office Renovation Project', 'contractor@buildcorp.com', 'John Builder', 'procurement@company.com', '2024-01-15 10:30:00+00', 'We are pleased to submit our bid for the office renovation project. Our bid amount is $85,000 for the complete renovation as specified in RFP-2024-001.', 'bid_submission'),
+('Inquiry about IT Services Tender RFP-2024-002', 'tech@innovate.com', 'Sarah Tech', 'procurement@company.com', '2024-01-14 15:45:00+00', 'We would like to inquire about the IT services tender. Could you please provide additional details about the required infrastructure?', 'bid_inquiry'),
+('Follow-up on Construction Bid RFP-2024-003', 'construction@megabuild.com', 'Mike Constructor', 'procurement@company.com', '2024-01-16 09:15:00+00', 'Following up on our bid submitted last week for the warehouse construction project. Please let us know if you need any additional documentation.', 'follow_up'),
+('Contract Amendment - Office Renovation', 'legal@buildcorp.com', 'Legal Department', 'procurement@company.com', '2024-01-18 14:20:00+00', 'Please find attached the contract amendment for the office renovation project. We have incorporated the requested changes.', 'contract_related');
+
+-- Insert sample projects if they don't exist
+INSERT INTO projects (name, description, project_type, budget_range, start_date, end_date, status) VALUES
+('Office Renovation Project', 'Complete renovation of headquarters office space', 'Construction', '$50,000 - $100,000', '2024-02-01', '2024-04-30', 'active'),
+('IT Infrastructure Upgrade', 'Upgrade of company IT infrastructure including servers and networking', 'IT Services', '$75,000 - $150,000', '2024-03-01', '2024-06-30', 'active'),
+('Warehouse Construction', 'Construction of new warehouse facility', 'Construction', '$200,000 - $500,000', '2024-04-01', '2024-12-31', 'active');
+
+-- Insert sample contractors
+INSERT INTO contractors (name, email, phone, certification_level) VALUES
+('BuildCorp Construction', 'contractor@buildcorp.com', '+1-555-0101', 'Certified General Contractor'),
+('Innovate Tech Solutions', 'tech@innovate.com', '+1-555-0102', 'IT Services Certified'),
+('MegaBuild Construction', 'construction@megabuild.com', '+1-555-0103', 'Licensed Contractor');
+
+-- Create a function for automatic bid identification based on email content
+CREATE OR REPLACE FUNCTION identify_bid_emails()
+RETURNS TRIGGER AS $$
+DECLARE
+    bid_keywords TEXT[] := ARRAY['bid', 'proposal', 'quote', 'tender', 'rfp', 'submission'];
+    project_keywords TEXT[] := ARRAY['project', 'renovation', 'construction', 'upgrade', 'services'];
+    email_content TEXT;
+    keyword TEXT;
+    classification_id UUID;
+BEGIN
+    -- Combine subject and body for analysis
+    email_content := LOWER(NEW.subject || ' ' || COALESCE(NEW.body_text, ''));
+    
+    -- Check for bid-related keywords
+    FOREACH keyword IN ARRAY bid_keywords LOOP
+        IF email_content LIKE '%' || keyword || '%' THEN
+            -- Classify as bid-related
+            IF email_content LIKE '%inquiry%' OR email_content LIKE '%question%' THEN
+                NEW.email_type := 'bid_inquiry';
+            ELSIF email_content LIKE '%follow%' OR email_content LIKE '%update%' THEN
+                NEW.email_type := 'follow_up';
+            ELSIF email_content LIKE '%contract%' OR email_content LIKE '%agreement%' THEN
+                NEW.email_type := 'contract_related';
+            ELSE
+                NEW.email_type := 'bid_submission';
+            END IF;
+            
+            NEW.is_processed := TRUE;
+            NEW.processing_status := 'processed';
+            EXIT;
+        END IF;
+    END LOOP;
+    
+    -- If no bid keywords found, check for project keywords
+    IF NEW.email_type = 'unknown' THEN
+        FOREACH keyword IN ARRAY project_keywords LOOP
+            IF email_content LIKE '%' || keyword || '%' THEN
+                NEW.email_type := 'project_update';
+                NEW.is_processed := TRUE;
+                NEW.processing_status := 'processed';
+                EXIT;
+            END IF;
+        END LOOP;
+    END IF;
+    
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Create trigger for automatic email classification
+DROP TRIGGER IF EXISTS email_classification_trigger ON email_records;
+CREATE TRIGGER email_classification_trigger
+    BEFORE INSERT OR UPDATE ON email_records
+    FOR EACH ROW
+    EXECUTE FUNCTION identify_bid_emails();
+
+-- Function to automatically create bid records from bid submission emails
+CREATE OR REPLACE FUNCTION create_bid_from_email()
+RETURNS TRIGGER AS $$
+DECLARE
+    contractor_record RECORD;
+    project_record RECORD;
+    bid_amount_extracted NUMERIC;
+    amount_text TEXT;
+BEGIN
+    -- Only process bid submission emails
+    IF NEW.email_type = 'bid_submission' AND NEW.is_processed = TRUE THEN
+        
+        -- Try to find or create contractor
+        SELECT * INTO contractor_record FROM contractors WHERE email = NEW.sender_email;
+        
+        IF NOT FOUND THEN
+            INSERT INTO contractors (name, email) 
+            VALUES (COALESCE(NEW.sender_name, NEW.sender_email), NEW.sender_email)
+            RETURNING * INTO contractor_record;
+        END IF;
+        
+        -- Try to extract project from email content
+        SELECT * INTO project_record FROM projects 
+        WHERE status = 'active' 
+        AND (LOWER(NEW.subject) LIKE '%' || LOWER(name) || '%' 
+             OR LOWER(COALESCE(NEW.body_text, '')) LIKE '%' || LOWER(name) || '%')
+        LIMIT 1;
+        
+        -- Extract bid amount from email content (simple regex pattern)
+        amount_text := substring(COALESCE(NEW.body_text, '') FROM '\$([0-9,]+(?:\.[0-9]{2})?)');
+        IF amount_text IS NOT NULL THEN
+            bid_amount_extracted := REPLACE(amount_text, ',', '')::NUMERIC;
+        END IF;
+        
+        -- Create bid record
+        INSERT INTO bids (
+            project_id, 
+            contractor_id, 
+            email_record_id, 
+            bid_amount, 
+            submission_date, 
+            notes,
+            status
+        ) VALUES (
+            project_record.id,
+            contractor_record.id,
+            NEW.id,
+            bid_amount_extracted,
+            NEW.received_date,
+            'Auto-created from email: ' || NEW.subject,
+            'submitted'
+        );
+        
+    END IF;
+    
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Create trigger for automatic bid creation
+DROP TRIGGER IF EXISTS bid_creation_trigger ON email_records;
+CREATE TRIGGER bid_creation_trigger
+    AFTER INSERT OR UPDATE ON email_records
+    FOR EACH ROW
+    EXECUTE FUNCTION create_bid_from_email();
